@@ -1,0 +1,216 @@
+#+title: Reverse Engineering the Duco Connectivity Board: From Black Box to Home Assistant
+
+My newly built house came with a promising feature: a DucoBox Energy Comfort D325 ventilation system with heat recovery. While the system efficiently preheats incoming air using outgoing air's heat, its control options were limited to four basic modes through a simple button interface. I wanted more - specifically, integration with Home Assistant. The official solution? A [[https://www.duco.eu/en/products/mechanical-ventilation/accessories/connectivity-board][Duco Connectivity Board]]. But when I noticed it was just an ESP32 in disguise, I knew there had to be a better way.
+
+
+The system operates in four general modes: one AUTO mode, which selects the mode automatically, and three manual modes that set airflow levels. By default, these modes are active for 15 minutes, but holding the button longer keeps the mode active until stopped.
+
+[[./duco-button.jpg]]
+
+* The Journey Begins: Hardware Reverse Engineering
+To work with the Duco Connectivity Board, we first needed information on its connection to the ventilation system. Fortunately, the manufacturer Duco has the amazing website [[https://duco.tv][duco.tv]], which contains many videos on how to maintain the ventilation system with detailed instructions, including on how the Connectivity Board can be installed. The board connects via a 12-pin connector on the ventilation system's PCB. Using a multimeter, we can figure out a basic pinout:
+
+[[./duco-pinout.jpg]]
+
+The Connectivity Board's design was surprisingly straightforward: it simply connected the ventilation system's communication pins directly to the ESP32's built-in serial interface (pins GPIO16/17).
+
+* Cracking the Code: Protocol Analysis
+We attached a logic analyzer to these pins to analyze the protocol, using some needle probes:
+
+[[./duco-analysis-complete.jpg]]
+
+With Saleae Logic, we determined the baud rate (57600) and identified the protocol as "Async Serial" (typically UART):
+
+[[./saleae-general.png]]
+
+* Is it modbus?
+Since the Connectivity Board exposes Modbus TCP, it seems reasonable to check if the connection is actually [[https://en.wikipedia.org/wiki/Modbus][Modbus]]. It would make our job a lot easier if it was!
+
+While our initial Modbus hypothesis hit a dead end, a pattern emerged: every message started with the distinctive bytes ~0xAA 0x55~. In protocol analysis, such consistent patterns often mark the beginning of messages:
+
+#+begin_src
+Board:  aa 55 04 0c 30 0a 00 d0 3f
+Box:    aa 55 02 0d 30 d4 84 aa 55 08 0e 30 01 00 00 00 00 00 dd 6e
+#+end_src
+
+Splitting the messages using the ~0xAA 0x55~ bytes, gives some useful info when plugged into [[https://rapidscada.net/modbus/][rapidscada.net/modbus]]. The messages do seem to have valid CRC codes and seem to be valid Modbus messages:
+
+[[./modbus-msg.png]]
+
+Something weird is still happening though: the function codes on any of the messages do not seem to be regular Modbus function codes. They do not match any of the function codes of Modbus. What usually is the slave addresses also seems to be something else: the length of the messages, minus the CRC.
+
+#+begin_quote
+The length includes an edge case: when a ~0xAA~ byte appears mid-message, it's followed by ~0x01~, ignored for length and CRC, likely to prevent ~0xAA 0x55~ from occurring in the middle of a message.
+#+end_quote
+
+* Its not Modbus, What Then?
+Time for a different approach. Let's just see what happens if we adjust the mode to MAN3 through the webinterface of the Connectivity Board. In the resulting traces the following stood out:
+
+[[./saleae-set-man3.png]]
+
+Let's also get a trace while setting MAN1 and compare the resulting messages:
+
+#+begin_src
+Board:   aa 55  05 0c 69 04 01 06  cd 80
+Box:     aa 55  02 0d 69  14 be
+Box:     aa 55  03 0e 69 01  8e 33
+
+Board:   aa 55  05 0c cb 04 01 04  6f f9
+Box:     aa 55  02 0d cb  95 07
+Box:     aa 55  03 0e cb 01  f7 53
+#+end_src
+
+Patterns emerged: the third byte (excluding the ~0xAA 0x55~ header) seemed to identify requests/responses, with the second byte acting as a "function code" (not corresponding to Modbus function codes). Conversations were identical except for the last data byte from the module.
+
+Here Duco saves us again with their documentation! The [[https://www.duco.eu/Wes/CDN/1/Attachments/information-sheet-Modbus-TCP-(en)_638543249352352865.pdf][Information sheet Modbus TCP]] gives us a mapping between modes and their respective codes:
+
+[[./duco-modes.png]]
+
+* Changing the comfort temperature
+The Duco Box uses a comfort temperature to decide when to use the heat exchanger. We changed it from 24.0 °C to 24.5 °C via the web interface:
+
+[[./saleae-write-comfort.png]]
+
+A bit more complicated this time! Let's break it down:
+
+#+begin_src
+Board:   aa 55  05 24 6a 00 12 0a  e1 36
+Box:     aa 55  02 25 6a  4a bf
+Box:     aa 55  09 26 6a 01 12 0a f0 00 00 00  2c ad
+
+Board:   aa 55  05 24 6b 00 12 0a  e0 ca
+Box:     aa 55  02 25 6b  8b 7f
+Box:     aa 55  09 26 6b 01 12 0a f0 00 00 00  ed 61
+
+Board:   aa 55  09 24 6c 01 12 0a f5 00 00 00  b5 2b
+Box:     aa 55  02 25 6c  ca bd
+Box:     aa 55  09 26 6c 01 12 0a f5 00 00 00  ac 4b
+#+end_src
+
+This seems like three conversations. The first two seem identical except for the message identifier. The third one has a different message from the module, while the box responds with similar messages. The seventh byte clearly is different though: it changes from ~0xF0~ to ~0xF5~. Conveniently, ~0xF0 = 240~ and ~0xF5 = 245~.
+
+The first two conversations here seem to read the comfort temperature before changing it. So this gives us even more information, how to read the comfort temperature!
+
+Also another pattern is starting to emerge here: it seems that every time a message is sent, the box will first acknowledge it with a short message before actually answering.
+* Reading the current mode
+Reading the current mode was more complex. The Connectivity Board didn't request this information at the moment you ask for it, but caches it instead. However, every few seconds the board sent a flurry of traffic. In AUTO (~= 0x00~) mode the following happens:
+
+#+begin_src
+Board:   aa 55  04 0c 1f 02 00  e6 36
+Box:     aa 55  02 0d 1f  95 58
+Box:     aa 55  16 0e 1f 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ae 9f
+
+Board:   aa 55  04 0c 20 02 01  17 fa
+Box:     aa 55  02 0d 20  d5 48
+Box:     aa 55  16 0e 20 00 01 2c 00 ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  90 46
+
+Board:   aa 55  04 0c 21 02 02  06 3b
+Box:     aa 55  02 0d 21  14 88
+Box:     aa 55  16 0e 21 00 00 00 00 ff 00 00 00 02 00 00 00 00 00 00 00 00 00 00 00  8c 35
+#+end_src
+
+In MAN3 (~= 0x06~) mode:
+
+#+begin_src
+Board:  aa 55  04 0c c3 02 00  27 cc
+Box:    aa 55  02 0d c3  94 c1
+Box:    aa 55  16 0e c3 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  a1 ce
+
+Board:  aa 55  04 0c c4 02 01  57 cd
+Box:    aa 55  02 0d c4  d5 03
+Box:    aa 55  16 0e c4 06 02 64 00 ff 00 00 00 00 00 00 00 7f 03 00 00 58 21 29 67  11 4c
+
+Board:  aa 55  04 0c c5 02 02  46 0c
+Box:    aa 55  02 0d c5  14 c3
+Box:    aa 55  16 0e c5 06 00 00 00 ff 00 00 83 02 ff 00 00 7f 03 00 00 58 21 29 67  17 d8
+#+end_src
+
+The fourth byte response shows the current mode, though not in every message.
+* Why so many requests?
+The webinterface of the Connectivity Board also shows multiple nodes being used by the ventilation system:
+
+[[./duco-webinterface-nodes.png]]
+
+Let's see if that corresponds to the messages:
+
+#+begin_src
+[...]
+Board:  aa 55  04 0c c6 02 03  77 cc
+Box:    aa 55  02 0d c6 54 c2
+Box:    aa 55  16 0e c6 06 00 00 00 ff 00 00 8f 03 ff 00 00 7f 03 00 00 58 21 29 67  c8 e4
+
+Board:  aa 55  04 0c c7 02 04  67 ce
+Box:    aa 55  02 0d c7 95 02
+Box:    aa 55  16 0e c7 06 00 00 00 ff 00 00 84 04 ff 00 00 7f 03 00 00 58 21 29 67  37 75
+
+Board:  aa 55  04 0c c8 02 05  96 0d
+Box:    aa 55  02 0d c8 d5 06
+Box:    aa 55  16 0e c8 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  1b b5
+
+[...]
+
+Board:  aa 55  04 0c f8 02 34  57 d6
+Box:    aa 55  02 0d f8 d5 12
+Box:    aa 55  16 0e f8 06 00 00 00 ff 00 00 00 00 00 00 00 7a 03 00 00 54 21 29 67  0d 8b
+
+[...]
+
+Board:  aa 55  04 0c 07 02 43  27 c0
+Box:    aa 55  02 0d 07 95 52
+Box:    aa 55  16 0e 07 06 00 00 00 ff 00 00 00 00 00 00 00 7a 03 00 00 55 21 29 67  17 77
+#+end_src
+
+Bingo! Only the nodes respond with actual data. Looking further, there also seem to be other messages to get information about nodes:
+
+#+begin_src
+Board:  aa 55  04 0c 3a 01 01  36 cd
+Box:    aa 55  02 0d 3a 54 83
+Box:    aa 55  09 0e 3a 11 03 01 01 00 00 1b  12 26
+
+[...]
+
+Board:  aa 55  04 0c 7f 0a 01  20 28
+Box:    aa 55  02 0d 7f 95 70
+Box:    aa 55  08 0e 7f 01 01 00 00 00 00  5e 6a
+#+end_src
+
+This gives a bit more information: the fourth byte contains ~0x11 = 17~, which according to the information sheet, is the Duco Box. Similarly, the other components can be identified that way as well. Giving us the following list of nodes:
+
+- Node 1, type 17 (0x11), BOX
+- Node 2, type 8 (0x08), UCBAT
+- Node 3, type 12 (0x0c), UCCO2
+- Node 4, type 12 (0x0c), UCCO2
+- Node 52, type 18 (0x12), SWITCH
+- Node 67, type 9 (0x09), UC
+* CO2 sensors
+With the basic protocol understood, we turned our attention to a more complex challenge: decoding the CO2 sensor readings. In the webinterface they show values between 0 (low air quality) and 100 (high air quality). However, that seems not to be what is actually communicated. Let's take a long trace and see some messages where node 3 and 4 get requested:
+
+#+begin_src
+[...]
+Board:  aa 55  07 10 85 01 03 00 49 04  04 6e
+Box:    aa 55  02 11 85  1d f3
+Box:    aa 55  0c 12 85 01 04 d4 00 d9 02 00 00 5a 76  2c 34
+[...]
+#+end_src
+
+The response includes ~0x02d9 = 729~. This could be a reasonable value for a CO2 ppm reading. Time to put it to a quick test! Breathing directly into one of the sensors should probably increase the value for a bit:
+
+#+begin_src
+Board:  aa 55  07 10 87 01 04 00 49 04  04 f8
+Box:    aa 55  02 11 87  9c 32
+Box:    aa 55  0c 12 87 01 04 e0 00 10 27 00 00 8d 76  26 c5
+#+end_src
+
+This changed the value to ~0x2710 = 10000~. This could be a valid maximum for a CO2 sensor. After a while this recovered to lower values:
+
+#+begin_src
+Board:  aa 55  07 10 9c 01 04 00 49 04  07 13
+Box:    aa 55  02 11 9c  dc 39
+Box:    aa 55  0c 12 9c 01 04 e2 00 86 15 00 00 90 76  fb 5a
+#+end_src
+
+The sensor recovers to ~0x1586 = 5510~.
+* ESPhome component
+Using similar techniques, it was possible to figure out more information from the module, such as the serial number, the replacement time for the filter and the current flow level of the system.
+
+This all made it possible to create an ESPhome component. The PR for this is now available on GitHub:
