@@ -213,4 +213,4 @@ The sensor recovers to ~0x1586 = 5510~.
 * ESPhome component
 Using similar techniques, it was possible to figure out more information from the module, such as the serial number, the replacement time for the filter and the current flow level of the system.
 
-This all made it possible to create an ESPhome component. The PR for this is now available on GitHub:
+This all made it possible to create an ESPhome component. The PR for this is now available on GitHub: https://github.com/esphome/esphome/pull/7993
